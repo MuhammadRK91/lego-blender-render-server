@@ -85,9 +85,9 @@ def root():
     return {
         "status": "running",
         "service": "lego-model-generator",
-        "message": "Send POST request to /generate-glb with image_geometry. Response includes GLB preview, optimized LEGO parts, build data, and product tier/pricing.",
+        "message": "Send POST request to /generate-glb with image_geometry. Response includes GLB preview, optimized LEGO parts, build data, and brick-count pricing.",
         "uses_blender": False,
-        "output": "glb_base64 + optimized_lego_model + product_tier"
+        "output": "glb_base64 + optimized_lego_model + pricing"
     }
 
 
@@ -96,7 +96,7 @@ def health():
     return {
         "status": "ok",
         "service": "lego-model-generator",
-        "mode": "image_geometry_to_glb_optimized_parts_and_product_tier",
+        "mode": "image_geometry_to_glb_optimized_parts_and_brick_count_pricing",
         "uses_blender": False
     }
 
@@ -486,105 +486,210 @@ def create_build_layers(optimized_placements):
     return build_layers
 
 
+def calculate_price_from_part_count(
+    optimized_part_count,
+    min_parts,
+    max_parts,
+    min_price,
+    max_price
+):
+    """
+    Calculates one recommended price inside the tier range.
+
+    Pricing is based only on optimized part count.
+    It does not change model quality.
+    """
+
+    if optimized_part_count <= min_parts:
+        return min_price
+
+    if optimized_part_count >= max_parts:
+        return max_price
+
+    position = (optimized_part_count - min_parts) / (max_parts - min_parts)
+    price = min_price + (position * (max_price - min_price))
+
+    # Round to a clean selling price ending in 9.
+    rounded = int(round(price / 10.0) * 10)
+
+    if rounded <= 50:
+        return max(min_price, rounded - 1)
+
+    return max(min_price, min(max_price, rounded - 1))
+
+
 def classify_product_tier(optimized_part_count, original_stud_count, reduction_percent):
     """
-    Classifies the product tier based on final optimized part count.
+    Classifies price tier based only on final optimized brick count.
 
     Important:
-    This does not reduce quality.
-    It only classifies the final model for pricing and selling.
+    - This does not reduce quality.
+    - This does not use image complexity to increase price.
+    - Basic / Standard / Premium means part-count tier, not quality tier.
     """
 
     if optimized_part_count <= 1500:
+        min_parts = 1
+        max_parts = 1500
+        min_price = 49
+        max_price = 99
+
+        recommended_price = calculate_price_from_part_count(
+            optimized_part_count,
+            min_parts,
+            max_parts,
+            min_price,
+            max_price
+        )
+
         return {
             "tier": "Basic",
-            "price_level": "Low",
-            "cost_level": "Low",
-            "quality_level": "Good",
-            "market_position": "Affordable entry-level custom LEGO-style product",
-            "suggested_price_range_usd": {
-                "min": 49,
-                "max": 99
+            "tier_basis": "optimized_part_count",
+            "part_count_range": {
+                "min": min_parts,
+                "max": max_parts
             },
+            "optimized_part_count": optimized_part_count,
+            "suggested_price_range_usd": {
+                "min": min_price,
+                "max": max_price
+            },
+            "recommended_price_usd": recommended_price,
+            "price_explanation": f"Price is calculated from {optimized_part_count} optimized parts inside the Basic range.",
+            "quality_note": "Quality was not reduced. Tier is based only on final optimized brick count.",
+            "market_position": "Affordable small-size custom LEGO-style product",
             "recommended_for": [
-                "simple portraits",
                 "small gifts",
-                "lower-cost customer option",
-                "quick production"
+                "simple portraits",
+                "lower-cost customer option"
             ],
             "notes": [
-                "This tier is suitable for smaller models with fewer parts.",
-                "Quality is acceptable, but detail level is naturally lower than Standard or Premium."
+                "Basic means lower brick count, not lower generation quality.",
+                "The model is still generated with quality-preserving optimization."
             ]
         }
 
     if optimized_part_count <= 4000:
+        min_parts = 1501
+        max_parts = 4000
+        min_price = 100
+        max_price = 179
+
+        recommended_price = calculate_price_from_part_count(
+            optimized_part_count,
+            min_parts,
+            max_parts,
+            min_price,
+            max_price
+        )
+
         return {
             "tier": "Standard",
-            "price_level": "Medium",
-            "cost_level": "Medium",
-            "quality_level": "High",
-            "market_position": "Balanced custom LEGO-style product with strong detail and reasonable cost",
-            "suggested_price_range_usd": {
-                "min": 100,
-                "max": 179
+            "tier_basis": "optimized_part_count",
+            "part_count_range": {
+                "min": min_parts,
+                "max": max_parts
             },
+            "optimized_part_count": optimized_part_count,
+            "suggested_price_range_usd": {
+                "min": min_price,
+                "max": max_price
+            },
+            "recommended_price_usd": recommended_price,
+            "price_explanation": f"Price is calculated from {optimized_part_count} optimized parts inside the Standard range.",
+            "quality_note": "Quality was not reduced. Tier is based only on final optimized brick count.",
+            "market_position": "Medium-size custom LEGO-style product",
             "recommended_for": [
-                "good-quality portraits",
-                "balanced price/detail products",
-                "most customers",
-                "standard catalog offering"
+                "balanced size and price",
+                "standard catalog offering",
+                "most customers"
             ],
             "notes": [
-                "This tier gives a strong balance between visual detail and part cost.",
-                "Recommended as the default commercial option when quality and price both matter."
+                "Standard means medium brick count, not medium quality.",
+                "The model keeps the generated visual detail."
             ]
         }
 
     if optimized_part_count <= 8000:
+        min_parts = 4001
+        max_parts = 8000
+        min_price = 180
+        max_price = 349
+
+        recommended_price = calculate_price_from_part_count(
+            optimized_part_count,
+            min_parts,
+            max_parts,
+            min_price,
+            max_price
+        )
+
         return {
             "tier": "Premium",
-            "price_level": "High",
-            "cost_level": "High",
-            "quality_level": "Very High",
-            "market_position": "High-detail custom LEGO-style display product",
-            "suggested_price_range_usd": {
-                "min": 180,
-                "max": 349
+            "tier_basis": "optimized_part_count",
+            "part_count_range": {
+                "min": min_parts,
+                "max": max_parts
             },
+            "optimized_part_count": optimized_part_count,
+            "suggested_price_range_usd": {
+                "min": min_price,
+                "max": max_price
+            },
+            "recommended_price_usd": recommended_price,
+            "price_explanation": f"Price is calculated from {optimized_part_count} optimized parts inside the Premium range.",
+            "quality_note": "Quality was not reduced. Tier is based only on final optimized brick count.",
+            "market_position": "Large custom LEGO-style display product",
             "recommended_for": [
-                "high-detail pet portraits",
+                "large pet portraits",
                 "premium gifts",
-                "large display models",
-                "customers who care about accuracy"
+                "display models"
             ],
             "notes": [
-                "This tier preserves strong visual accuracy and detail.",
-                "Part count is higher, but the model quality is better.",
-                "This is suitable when image quality should not be compromised."
+                "Premium means higher brick count, not artificially enhanced quality.",
+                "The higher price is caused by more physical parts."
             ]
         }
 
+    # Ultra pricing continues above 8,000 parts.
+    # This avoids a vague $350-$700 decision.
+    # Formula: $349 base + $0.045 per optimized part above 8,000.
+    extra_parts = optimized_part_count - 8000
+    raw_price = 349 + (extra_parts * 0.045)
+    recommended_price = int(round(raw_price / 10.0) * 10) - 1
+
+    if recommended_price < 350:
+        recommended_price = 350
+
+    manual_quote_recommended = optimized_part_count > 18000
+
     return {
         "tier": "Ultra / Manual Review",
-        "price_level": "Very High",
-        "cost_level": "Very High",
-        "quality_level": "Maximum",
-        "market_position": "Large advanced custom LEGO-style model requiring manual review",
+        "tier_basis": "optimized_part_count",
+        "part_count_range": {
+            "min": 8001,
+            "max": None
+        },
+        "optimized_part_count": optimized_part_count,
         "suggested_price_range_usd": {
             "min": 350,
-            "max": 700
+            "max": None
         },
+        "recommended_price_usd": recommended_price,
+        "price_formula": "$349 + $0.045 per optimized part above 8,000",
+        "price_explanation": f"Price is calculated from {optimized_part_count} optimized parts. Ultra pricing continues above the Premium range.",
+        "manual_quote_recommended": manual_quote_recommended,
+        "quality_note": "Quality was not reduced. Tier is based only on final optimized brick count.",
+        "market_position": "Very large custom LEGO-style model",
         "recommended_for": [
-            "large premium commissions",
-            "complex images",
+            "large commissions",
             "collector display models",
-            "manual designer review"
+            "very high part-count models"
         ],
         "notes": [
-            "This model is very large and may be expensive to produce.",
-            "Manual review is recommended before selling.",
-            "Do not automatically reduce quality unless the customer requests a cheaper version."
+            "Ultra means very high brick count.",
+            "Manual review is recommended for very large models before production.",
+            "Complexity does not directly change the price; physical part count does."
         ]
     }
 
@@ -614,23 +719,24 @@ def create_quality_preservation_report(original_placement_count, optimized_place
         "original_placement_count": original_placement_count,
         "optimized_part_count": optimized_part_count,
         "reduction_percent": reduction_percent,
-        "warning": "Further reduction should be done only by generating separate Basic or Standard versions from the first server, not by damaging this high-quality version."
+        "warning": "Further reduction should be done only by generating separate lower brick-count versions from the first server, not by damaging this quality-preserved version."
     }
 
 
 def create_commercial_summary(product_tier, optimized_part_count, original_placement_count, reduction_percent):
     return {
+        "pricing_basis": "optimized_part_count_only",
         "tier": product_tier.get("tier"),
         "recommended_selling_position": product_tier.get("market_position"),
-        "quality_level": product_tier.get("quality_level"),
-        "price_level": product_tier.get("price_level"),
-        "cost_level": product_tier.get("cost_level"),
         "optimized_part_count": optimized_part_count,
         "original_placement_count": original_placement_count,
         "part_reduction_percent": reduction_percent,
         "suggested_price_range_usd": product_tier.get("suggested_price_range_usd"),
-        "production_note": "This classification is based on optimized part count. It does not reduce model quality.",
-        "recommended_next_action": "Use this version as the quality-preserved product. Create cheaper Basic/Standard variants separately only if the customer needs a lower price."
+        "recommended_price_usd": product_tier.get("recommended_price_usd"),
+        "price_explanation": product_tier.get("price_explanation"),
+        "quality_note": "Basic, Standard, Premium, and Ultra are based on part count only. They do not mean different generation quality.",
+        "production_note": "The model is optimized using lossless grid merging. Quality is not reduced to force a cheaper price.",
+        "recommended_next_action": "Use recommended_price_usd as the default product price. Use manual review only for very high part-count models."
     }
 
 
@@ -806,7 +912,7 @@ async def generate_glb(data: dict):
 
         return {
             "success": True,
-            "message": "GLB model, optimized LEGO parts, and product tier generated successfully",
+            "message": "GLB model, optimized LEGO parts, and brick-count pricing generated successfully",
             "job_id": job_id,
 
             "glb": {
@@ -832,6 +938,7 @@ async def generate_glb(data: dict):
                 "reduction_percent": reduction_percent,
 
                 "product_tier": product_tier,
+                "pricing": product_tier,
                 "commercial_summary": commercial_summary,
                 "quality_preservation_report": quality_preservation_report,
 
@@ -844,8 +951,10 @@ async def generate_glb(data: dict):
 
             # Convenience fields for n8n
             "product_tier": product_tier,
+            "pricing": product_tier,
             "commercial_summary": commercial_summary,
             "quality_preservation_report": quality_preservation_report,
+            "recommended_price_usd": product_tier.get("recommended_price_usd"),
 
             "width": width,
             "height": height,
