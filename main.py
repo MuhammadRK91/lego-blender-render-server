@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Body
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import base64
@@ -1145,7 +1145,7 @@ def generate_glb_from_optimized_geometry(geometry, optimized_placements):
 # Main endpoint
 # ---------------------------------------------------------------------
 @app.post("/generate-glb")
-async def generate_glb(data: Any):
+async def generate_glb(data: Any = Body(...)):
     job_id = str(uuid.uuid4())
     start_time = time.time()
 
