@@ -344,6 +344,59 @@ def extract_candidate_parts_catalog(data):
     return None
 
 
+
+
+def get_optimizer_ready_parts(candidate_parts_catalog):
+    """
+    Returns optimizer-ready parts from Server 1 candidate_parts_catalog.
+    Falls back to safe default catalog if catalog is missing or invalid.
+
+    This function is required by build_optimizer_catalog().
+    Without it, Server 2 raises: name 'get_optimizer_ready_parts' is not defined.
+    """
+    if not isinstance(candidate_parts_catalog, dict):
+        return FALLBACK_OPTIMIZER_READY_PARTS
+
+    parts = candidate_parts_catalog.get("optimizer_ready_parts")
+
+    if isinstance(parts, list) and parts:
+        clean_parts = []
+
+        for p in parts:
+            if not isinstance(p, dict):
+                continue
+
+            if p.get("optimizer_ready") is False:
+                continue
+
+            if p.get("product_safe") is False:
+                continue
+
+            w = safe_int(p.get("w"))
+            h = safe_int(p.get("h"))
+
+            if not w or not h:
+                continue
+
+            if w <= 0 or h <= 0:
+                continue
+
+            # Avoid very large parts in automatic optimizer.
+            if w > 8 or h > 8:
+                continue
+
+            clean = dict(p)
+            clean["w"] = w
+            clean["h"] = h
+            clean["role"] = normalize_role(clean.get("role"))
+            clean_parts.append(clean)
+
+        if clean_parts:
+            return clean_parts
+
+    return FALLBACK_OPTIMIZER_READY_PARTS
+
+
 # ---------------------------------------------------------------------
 # Dynamic optimizer catalog
 # ---------------------------------------------------------------------
