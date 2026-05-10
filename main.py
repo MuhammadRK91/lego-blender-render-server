@@ -31,6 +31,26 @@ BLOCK_GAP = 0.025
 # Safety limit
 MAX_PLACEMENTS = 30000
 
+# ---------------------------------------------------------------------
+# Practical support strategy
+# ---------------------------------------------------------------------
+# The visual GLB keeps the full relief height, but the purchase BOM should
+# not count hidden support plates under every single raised tile.
+# For a real sellable mosaic/relief kit, we count:
+# 1) every visible top tile/part, plus
+# 2) a practical neutral backing/support pack, plus
+# 3) a smaller selective riser pack for raised/high-detail areas.
+# This keeps the visual quality while making the physical BOM commercially practical.
+PRACTICAL_SUPPORT_MODE = True
+BACKING_SUPPORT_RATIO = 0.10
+SELECTIVE_RISER_RATIO = 0.08
+EDGE_REINFORCEMENT_RATIO = 0.03
+MIN_PRACTICAL_SUPPORT_PARTS = 80
+MAX_PRACTICAL_SUPPORT_RATIO_OF_VISIBLE = 0.28
+SUPPORT_COLOR_ID = 71
+SUPPORT_COLOR_NAME = "Light Bluish Gray"
+SUPPORT_COLOR_RGB = "A0A5A9"
+
 
 # ---------------------------------------------------------------------
 # Fallback optimizer catalog
@@ -77,7 +97,7 @@ def root():
         "service": "lego-model-generator",
         "message": "Send POST request to /generate-glb with image_geometry and candidate_parts_catalog from Server 1.",
         "uses_blender": False,
-        "output": "glb_base64 + optimized_lego_model + realistic parts + pricing"
+        "output": "glb_base64 + optimized_lego_model + practical BOM + pricing"
     }
 
 
@@ -89,7 +109,7 @@ def health():
         "mode": "image_geometry_to_glb_using_server_1_optimizer_ready_parts",
         "uses_blender": False,
         "supports_candidate_parts_catalog": True,
-        "pricing_basis": "actual_physical_purchase_part_count"
+        "pricing_basis": "actual_physical_purchase_part_count_with_practical_support_bom"
     }
 
 
@@ -766,15 +786,133 @@ def create_instruction_parts_summary(optimized_placements):
     return summary
 
 
+def get_best_support_part(optimized_placements):
+    """
+    Finds a realistic structure plate already selected by the optimizer.
+    Prefer larger plates because they reduce hidden support quantity.
+    """
+    candidates = {}
+
+    for p in optimized_placements:
+        part_num = p.get("support_part_num") or p.get("part_num")
+        part_name = p.get("support_part_name") or p.get("part_name")
+        w = safe_int(p.get("w"), 1) or 1
+        h = safe_int(p.get("h"), 1) or 1
+
+        if not part_num:
+            continue
+
+        key = str(part_num)
+        area = max(1, w * h)
+
+        if key not in candidates or area > candidates[key]["area"]:
+            candidates[key] = {
+                "part_num": key,
+                "part_name": part_name or "Support Plate",
+                "area": area,
+                "w": w,
+                "h": h,
+            }
+
+    if candidates:
+        # Prefer common large support plates when present.
+        preferred_order = ["3020", "3021", "3022", "3710", "3623", "3023", "3024"]
+        for part_num in preferred_order:
+            if part_num in candidates:
+                return candidates[part_num]
+
+        return sorted(candidates.values(), key=lambda x: x["area"], reverse=True)[0]
+
+    return {
+        "part_num": "3020",
+        "part_name": "Plate 2x4",
+        "area": 8,
+        "w": 2,
+        "h": 4,
+    }
+
+
+def calculate_practical_support_quantities(optimized_placements):
+    """
+    Calculates a practical hidden support pack instead of stacking plates
+    under every raised visible piece.
+
+    Why this is more realistic:
+    - A real product can use a backing board/base layer for stability.
+    - We only need selective LEGO support/riser pieces, not full solid stacks
+      under every visible tile.
+    - The GLB still shows the visual relief; only the purchase BOM becomes practical.
+    """
+    visible_count = len(optimized_placements)
+
+    if visible_count <= 0:
+        return {
+            "backing_support_qty": 0,
+            "selective_riser_qty": 0,
+            "edge_reinforcement_qty": 0,
+            "total_practical_support_qty": 0,
+            "estimated_solid_stack_support_qty_avoided": 0,
+            "support_reduction_percent_vs_solid_stack": 0,
+        }
+
+    heights = [max(1, min(12, int(p.get("height_plates", 1)))) for p in optimized_placements]
+    sorted_heights = sorted(heights)
+    median_height = sorted_heights[len(sorted_heights) // 2]
+
+    elevated_count = sum(1 for h in heights if h > median_height)
+    high_detail_count = sum(1 for h in heights if h >= median_height + 2)
+
+    # Old solid-stack logic roughly counted (height_plates - 1) hidden supports
+    # per visible placement. We keep this only as a comparison/diagnostic.
+    estimated_solid_stack_support_qty = sum(max(0, h - 1) for h in heights)
+
+    backing_support_qty = int(round(visible_count * BACKING_SUPPORT_RATIO))
+    selective_riser_qty = int(round((elevated_count + high_detail_count) * SELECTIVE_RISER_RATIO))
+    edge_reinforcement_qty = int(round(visible_count * EDGE_REINFORCEMENT_RATIO))
+
+    total = backing_support_qty + selective_riser_qty + edge_reinforcement_qty
+
+    # Keep support pack useful but capped.
+    min_support = min(MIN_PRACTICAL_SUPPORT_PARTS, max(0, visible_count))
+    max_support = int(round(visible_count * MAX_PRACTICAL_SUPPORT_RATIO_OF_VISIBLE))
+
+    if total < min_support:
+        total = min_support
+
+    if max_support > 0 and total > max_support:
+        total = max_support
+
+    # Rebalance after caps.
+    backing_support_qty = int(round(total * 0.55))
+    selective_riser_qty = int(round(total * 0.30))
+    edge_reinforcement_qty = max(0, total - backing_support_qty - selective_riser_qty)
+
+    avoided = max(0, estimated_solid_stack_support_qty - total)
+    reduction_percent = round((avoided / estimated_solid_stack_support_qty) * 100, 2) if estimated_solid_stack_support_qty else 0
+
+    return {
+        "backing_support_qty": backing_support_qty,
+        "selective_riser_qty": selective_riser_qty,
+        "edge_reinforcement_qty": edge_reinforcement_qty,
+        "total_practical_support_qty": total,
+        "median_height_plates": median_height,
+        "elevated_visual_block_count": elevated_count,
+        "high_detail_visual_block_count": high_detail_count,
+        "estimated_solid_stack_support_qty_avoided": avoided,
+        "support_reduction_percent_vs_solid_stack": reduction_percent,
+    }
+
+
 def create_purchase_parts_summary(optimized_placements):
     """
     Purchase-focused parts grouped by part_num + color_id only.
 
-    This creates a realistic physical BOM:
-    - visible top tile/part = 1 piece
-    - support plate stack underneath = height_plates - 1 pieces
-      when a surface/detail tile is used as the top piece
-    - if the visible part is already a structure plate, total quantity = height_plates
+    Practical BOM logic:
+    - Count every visible top tile/part exactly once.
+    - Do NOT stack hidden support plates under every raised tile.
+    - Add a neutral practical support pack for backing, selective risers, and edge reinforcement.
+
+    This keeps the visual output quality but makes the real kit commercially practical.
     """
     agg = {}
 
@@ -784,51 +922,87 @@ def create_purchase_parts_summary(optimized_placements):
         color_rgb = p.get("rebrickable_color_rgb")
         height_plates = max(1, min(12, int(p.get("height_plates", 1))))
 
-        visible_role = normalize_role(p.get("part_role"))
+        # One visible top piece only.
+        # Height remains in optimized_placements/build_layers for instructions and GLB,
+        # but we do not multiply quantity by height_plates in the purchase BOM.
+        add_purchase_part(
+            agg=agg,
+            part_num=p.get("part_num"),
+            part_name=p.get("part_name"),
+            color_id=color_id,
+            color_name=color_name,
+            color_rgb=color_rgb,
+            quantity=1,
+            role="visible_surface",
+            source_height_plates=height_plates
+        )
 
-        if visible_role == "structure":
-            # A plate footprint stacked height_plates high.
-            add_purchase_part(
-                agg=agg,
-                part_num=p.get("part_num"),
-                part_name=p.get("part_name"),
-                color_id=color_id,
-                color_name=color_name,
-                color_rgb=color_rgb,
-                quantity=height_plates,
-                role="structure_stack",
-                source_height_plates=height_plates
-            )
-        else:
-            # One visible top tile/detail part.
-            add_purchase_part(
-                agg=agg,
-                part_num=p.get("part_num"),
-                part_name=p.get("part_name"),
-                color_id=color_id,
-                color_name=color_name,
-                color_rgb=color_rgb,
-                quantity=1,
-                role="visible_surface",
-                source_height_plates=height_plates
-            )
+    support_part = get_best_support_part(optimized_placements)
+    support_quantities = calculate_practical_support_quantities(optimized_placements)
 
-            # Plates underneath to reach the relief height.
-            support_qty = height_plates - 1
-            if support_qty > 0:
-                add_purchase_part(
-                    agg=agg,
-                    part_num=p.get("support_part_num"),
-                    part_name=p.get("support_part_name"),
-                    color_id=color_id,
-                    color_name=color_name,
-                    color_rgb=color_rgb,
-                    quantity=support_qty,
-                    role="support_stack",
-                    source_height_plates=height_plates
-                )
+    if PRACTICAL_SUPPORT_MODE and support_quantities["total_practical_support_qty"] > 0:
+        add_purchase_part(
+            agg=agg,
+            part_num=support_part["part_num"],
+            part_name=support_part["part_name"],
+            color_id=SUPPORT_COLOR_ID,
+            color_name=SUPPORT_COLOR_NAME,
+            color_rgb=SUPPORT_COLOR_RGB,
+            quantity=support_quantities["backing_support_qty"],
+            role="practical_backing_support",
+            source_height_plates="mixed"
+        )
+
+        add_purchase_part(
+            agg=agg,
+            part_num=support_part["part_num"],
+            part_name=support_part["part_name"],
+            color_id=SUPPORT_COLOR_ID,
+            color_name=SUPPORT_COLOR_NAME,
+            color_rgb=SUPPORT_COLOR_RGB,
+            quantity=support_quantities["selective_riser_qty"],
+            role="selective_riser_support",
+            source_height_plates="mixed"
+        )
+
+        add_purchase_part(
+            agg=agg,
+            part_num=support_part["part_num"],
+            part_name=support_part["part_name"],
+            color_id=SUPPORT_COLOR_ID,
+            color_name=SUPPORT_COLOR_NAME,
+            color_rgb=SUPPORT_COLOR_RGB,
+            quantity=support_quantities["edge_reinforcement_qty"],
+            role="edge_reinforcement_support",
+            source_height_plates="mixed"
+        )
 
     return agg
+
+
+def create_support_strategy_summary(optimized_placements, purchase_parts_summary):
+    visible_count = len(optimized_placements)
+    support_quantities = calculate_practical_support_quantities(optimized_placements)
+    physical_part_count = sum(int(item.get("quantity", 0)) for item in purchase_parts_summary.values())
+    visible_top_piece_count = sum(int(item.get("quantity", 0)) for item in purchase_parts_summary.values() if item.get("role") == "visible_surface")
+    support_piece_count = max(0, physical_part_count - visible_top_piece_count)
+
+    return {
+        "support_strategy": "practical_backing_and_selective_risers",
+        "visual_quality_preserved": True,
+        "glb_relief_height_preserved": True,
+        "bom_support_mode": "practical_not_solid_stack",
+        "visible_top_piece_count": visible_top_piece_count,
+        "practical_support_piece_count": support_piece_count,
+        "total_physical_purchase_part_count": physical_part_count,
+        "old_solid_stack_support_qty_avoided": support_quantities.get("estimated_solid_stack_support_qty_avoided"),
+        "support_reduction_percent_vs_old_solid_stack": support_quantities.get("support_reduction_percent_vs_solid_stack"),
+        "backing_support_qty": support_quantities.get("backing_support_qty"),
+        "selective_riser_qty": support_quantities.get("selective_riser_qty"),
+        "edge_reinforcement_qty": support_quantities.get("edge_reinforcement_qty"),
+        "explanation": "The visible design is unchanged. The BOM now counts one visible top piece per optimized block plus a neutral backing/riser support pack, instead of stacking hidden plates under every raised tile.",
+        "production_note": "For physical production, use a rigid backing/base and selective LEGO support pieces. This keeps the product buildable without creating an unrealistic 20k+ part kit."
+    }
 
 
 def create_rebrickable_parts_export(purchase_parts_summary):
@@ -1050,7 +1224,7 @@ def classify_product_tier(physical_part_count, optimized_visual_block_count, ori
     }
 
 
-def create_quality_preservation_report(original_placement_count, optimized_visual_block_count, physical_part_count, reduction_percent, catalog_source):
+def create_quality_preservation_report(original_placement_count, optimized_visual_block_count, physical_part_count, reduction_percent, catalog_source, support_strategy_summary=None):
     """
     Explains how the optimizer reduced visual block count without damaging image quality.
     """
@@ -1070,19 +1244,20 @@ def create_quality_preservation_report(original_placement_count, optimized_visua
             "multiple adjacent matching 1x1 grid cells can become larger footprint parts",
             "Server 2 now uses optimizer_ready_parts from Server 1 instead of only 7 hardcoded plates",
             "purchase_parts_list groups real physical parts by part number and color",
-            "support stacks are counted when relief height is greater than one plate"
+            "hidden support is now counted using a practical backing/selective-riser strategy instead of full solid stacking"
         ],
         "original_placement_count": original_placement_count,
         "optimized_visual_block_count": optimized_visual_block_count,
         "actual_physical_purchase_part_count": physical_part_count,
         "visual_block_reduction_percent": reduction_percent,
-        "warning": "Further reduction should be done only by generating separate lower brick-count versions from the first server, not by damaging this quality-preserved version."
+        "support_strategy_summary": support_strategy_summary or {},
+        "warning": "Further reduction should be done by changing product size/version, not by damaging this quality-preserved version."
     }
 
 
 def create_commercial_summary(product_tier, physical_part_count, optimized_visual_block_count, original_placement_count, reduction_percent):
     return {
-        "pricing_basis": "actual_physical_purchase_part_count",
+        "pricing_basis": "actual_physical_purchase_part_count_with_practical_support_bom",
         "tier": product_tier.get("tier"),
         "recommended_selling_position": product_tier.get("market_position"),
         "physical_part_count": physical_part_count,
@@ -1093,7 +1268,7 @@ def create_commercial_summary(product_tier, physical_part_count, optimized_visua
         "recommended_price_usd": product_tier.get("recommended_price_usd"),
         "price_explanation": product_tier.get("price_explanation"),
         "quality_note": "Basic, Standard, Premium, and Ultra are based on actual physical part count only. They do not mean different generation quality.",
-        "production_note": "The model is optimized using lossless grid merging and Server 1 optimizer-ready parts. Quality is not reduced to force a cheaper price.",
+        "production_note": "The model is optimized using lossless grid merging, Server 1 optimizer-ready parts, and practical backing/selective-riser support counting. Quality is not reduced to force a cheaper price.",
         "recommended_next_action": "Use recommended_price_usd as the default product price. Use manual review only for very high physical part-count models."
     }
 
@@ -1247,6 +1422,7 @@ async def generate_glb(data: Any = Body(...)):
 
         instruction_parts_summary = create_instruction_parts_summary(optimized_placements)
         purchase_parts_summary = create_purchase_parts_summary(optimized_placements)
+        support_strategy_summary = create_support_strategy_summary(optimized_placements, purchase_parts_summary)
 
         purchase_parts_list = list(purchase_parts_summary.values())
         purchase_parts_list.sort(key=lambda x: (str(x.get("part_num")), int(x.get("color_id")) if str(x.get("color_id")).isdigit() else 9999))
@@ -1276,7 +1452,8 @@ async def generate_glb(data: Any = Body(...)):
             optimized_visual_block_count=optimized_visual_block_count,
             physical_part_count=physical_part_count,
             reduction_percent=reduction_percent,
-            catalog_source=optimizer_catalog.get("source")
+            catalog_source=optimizer_catalog.get("source"),
+            support_strategy_summary=support_strategy_summary
         )
 
         commercial_summary = create_commercial_summary(
@@ -1345,6 +1522,7 @@ async def generate_glb(data: Any = Body(...)):
                 "pricing": product_tier,
                 "commercial_summary": commercial_summary,
                 "quality_preservation_report": quality_preservation_report,
+                "support_strategy_summary": support_strategy_summary,
 
                 "optimized_placements": optimized_placements,
 
@@ -1370,6 +1548,7 @@ async def generate_glb(data: Any = Body(...)):
             "pricing": product_tier,
             "commercial_summary": commercial_summary,
             "quality_preservation_report": quality_preservation_report,
+            "support_strategy_summary": support_strategy_summary,
             "recommended_price_usd": product_tier.get("recommended_price_usd"),
 
             "width": width,
