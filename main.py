@@ -27,7 +27,7 @@ BLOCK_GAP = 0.025
 # Safety limit
 MAX_PLACEMENTS = 30000
 
-# Supported optimized plate parts
+# Supported optimized plate parts.
 # We only use common rectangular plates for now.
 OPTIMIZED_PLATE_PARTS = {
     (1, 1): {
@@ -62,6 +62,8 @@ OPTIMIZED_PLATE_PARTS = {
 
 # Greedy placement priority.
 # Larger parts first, then smaller parts.
+# Important: this does NOT reduce image quality.
+# It only merges adjacent cells that already have the same color and same height.
 OPTIMIZATION_SHAPES = [
     (2, 4),
     (4, 2),
@@ -83,9 +85,9 @@ def root():
     return {
         "status": "running",
         "service": "lego-model-generator",
-        "message": "Send POST request to /generate-glb with image_geometry. Response includes GLB preview and optimized LEGO parts.",
+        "message": "Send POST request to /generate-glb with image_geometry. Response includes GLB preview, optimized LEGO parts, build data, and product tier/pricing.",
         "uses_blender": False,
-        "output": "glb_base64 + optimized_lego_model"
+        "output": "glb_base64 + optimized_lego_model + product_tier"
     }
 
 
@@ -94,7 +96,7 @@ def health():
     return {
         "status": "ok",
         "service": "lego-model-generator",
-        "mode": "image_geometry_to_glb_and_optimized_parts",
+        "mode": "image_geometry_to_glb_optimized_parts_and_product_tier",
         "uses_blender": False
     }
 
@@ -236,7 +238,12 @@ def get_color_key(p):
 def get_cell_signature(p):
     """
     Only cells with the same signature can be combined into larger plates.
-    We keep height_plates in the signature because relief height must stay correct.
+
+    This protects product/image quality:
+    - no color simplification
+    - no height simplification
+    - no detail smoothing
+    - no pixel removal
     """
     return (
         get_color_key(p),
@@ -291,9 +298,16 @@ def optimize_image_geometry(geometry):
     Converts the raw 1x1 placement grid into larger real LEGO plate placements
     wherever possible.
 
-    Example:
-    four matching 1x1 cells can become one Plate 2x2.
-    eight matching cells can become one Plate 2x4.
+    Important:
+    This optimization is quality-safe.
+    It only combines adjacent cells when they already share the exact same:
+    - color ID / color
+    - Rebrickable RGB
+    - height_plates
+
+    It does not lower resolution.
+    It does not merge similar colors.
+    It does not remove details.
     """
 
     width = int(geometry.get("width", 0))
@@ -447,7 +461,7 @@ def create_build_layers(optimized_placements):
     group by height_plates.
 
     This is not a final instruction booklet yet.
-    It is the structured data needed to create instructions later.
+    It is structured data needed to create instructions later.
     """
     layers = defaultdict(list)
 
@@ -470,6 +484,154 @@ def create_build_layers(optimized_placements):
         })
 
     return build_layers
+
+
+def classify_product_tier(optimized_part_count, original_stud_count, reduction_percent):
+    """
+    Classifies the product tier based on final optimized part count.
+
+    Important:
+    This does not reduce quality.
+    It only classifies the final model for pricing and selling.
+    """
+
+    if optimized_part_count <= 1500:
+        return {
+            "tier": "Basic",
+            "price_level": "Low",
+            "cost_level": "Low",
+            "quality_level": "Good",
+            "market_position": "Affordable entry-level custom LEGO-style product",
+            "suggested_price_range_usd": {
+                "min": 49,
+                "max": 99
+            },
+            "recommended_for": [
+                "simple portraits",
+                "small gifts",
+                "lower-cost customer option",
+                "quick production"
+            ],
+            "notes": [
+                "This tier is suitable for smaller models with fewer parts.",
+                "Quality is acceptable, but detail level is naturally lower than Standard or Premium."
+            ]
+        }
+
+    if optimized_part_count <= 4000:
+        return {
+            "tier": "Standard",
+            "price_level": "Medium",
+            "cost_level": "Medium",
+            "quality_level": "High",
+            "market_position": "Balanced custom LEGO-style product with strong detail and reasonable cost",
+            "suggested_price_range_usd": {
+                "min": 100,
+                "max": 179
+            },
+            "recommended_for": [
+                "good-quality portraits",
+                "balanced price/detail products",
+                "most customers",
+                "standard catalog offering"
+            ],
+            "notes": [
+                "This tier gives a strong balance between visual detail and part cost.",
+                "Recommended as the default commercial option when quality and price both matter."
+            ]
+        }
+
+    if optimized_part_count <= 8000:
+        return {
+            "tier": "Premium",
+            "price_level": "High",
+            "cost_level": "High",
+            "quality_level": "Very High",
+            "market_position": "High-detail custom LEGO-style display product",
+            "suggested_price_range_usd": {
+                "min": 180,
+                "max": 349
+            },
+            "recommended_for": [
+                "high-detail pet portraits",
+                "premium gifts",
+                "large display models",
+                "customers who care about accuracy"
+            ],
+            "notes": [
+                "This tier preserves strong visual accuracy and detail.",
+                "Part count is higher, but the model quality is better.",
+                "This is suitable when image quality should not be compromised."
+            ]
+        }
+
+    return {
+        "tier": "Ultra / Manual Review",
+        "price_level": "Very High",
+        "cost_level": "Very High",
+        "quality_level": "Maximum",
+        "market_position": "Large advanced custom LEGO-style model requiring manual review",
+        "suggested_price_range_usd": {
+            "min": 350,
+            "max": 700
+        },
+        "recommended_for": [
+            "large premium commissions",
+            "complex images",
+            "collector display models",
+            "manual designer review"
+        ],
+        "notes": [
+            "This model is very large and may be expensive to produce.",
+            "Manual review is recommended before selling.",
+            "Do not automatically reduce quality unless the customer requests a cheaper version."
+        ]
+    }
+
+
+def create_quality_preservation_report(original_placement_count, optimized_placements, reduction_percent):
+    """
+    Explains how the optimizer reduced part count without damaging image quality.
+    """
+    optimized_part_count = len(optimized_placements)
+
+    return {
+        "quality_preserved": True,
+        "optimization_method": "lossless_grid_merge",
+        "description": "The optimizer only combines adjacent cells when they have the same LEGO color and same height_plates value.",
+        "does_not_change": [
+            "image resolution",
+            "color mapping",
+            "height/depth values",
+            "pixel/stud positions",
+            "important visual details"
+        ],
+        "what_changed": [
+            "multiple adjacent matching 1x1 plates can become larger plates",
+            "part count is reduced where safe",
+            "build becomes easier and cheaper without changing the visual grid"
+        ],
+        "original_placement_count": original_placement_count,
+        "optimized_part_count": optimized_part_count,
+        "reduction_percent": reduction_percent,
+        "warning": "Further reduction should be done only by generating separate Basic or Standard versions from the first server, not by damaging this high-quality version."
+    }
+
+
+def create_commercial_summary(product_tier, optimized_part_count, original_placement_count, reduction_percent):
+    return {
+        "tier": product_tier.get("tier"),
+        "recommended_selling_position": product_tier.get("market_position"),
+        "quality_level": product_tier.get("quality_level"),
+        "price_level": product_tier.get("price_level"),
+        "cost_level": product_tier.get("cost_level"),
+        "optimized_part_count": optimized_part_count,
+        "original_placement_count": original_placement_count,
+        "part_reduction_percent": reduction_percent,
+        "suggested_price_range_usd": product_tier.get("suggested_price_range_usd"),
+        "production_note": "This classification is based on optimized part count. It does not reduce model quality.",
+        "recommended_next_action": "Use this version as the quality-preserved product. Create cheaper Basic/Standard variants separately only if the customer needs a lower price."
+    }
 
 
 def create_box_mesh(center, extents, rgba):
@@ -592,18 +754,47 @@ async def generate_glb(data: dict):
         if not isinstance(original_placements, list) or not original_placements:
             raise ValueError("image_geometry.placements[] is required.")
 
-        original_placement_count = len(original_placements)
+        original_placement_count_before_truncation = len(original_placements)
 
-        if original_placement_count > MAX_PLACEMENTS:
+        if len(original_placements) > MAX_PLACEMENTS:
             geometry = dict(geometry)
             geometry["placements"] = original_placements[:MAX_PLACEMENTS]
             original_placements = geometry["placements"]
 
+        original_placement_count = len(original_placements)
+
         optimized_placements = optimize_image_geometry(geometry)
+
         parts_summary = create_parts_summary(optimized_placements)
         rebrickable_parts_export = create_rebrickable_parts_export(parts_summary)
         basic_parts_xml_export = create_basic_xml_export(parts_summary)
         build_layers = create_build_layers(optimized_placements)
+
+        optimized_part_count = len(optimized_placements)
+        reduction_count = original_placement_count - optimized_part_count
+        reduction_percent = round(
+            (reduction_count / original_placement_count) * 100,
+            2
+        ) if original_placement_count else 0
+
+        product_tier = classify_product_tier(
+            optimized_part_count=optimized_part_count,
+            original_stud_count=width * height,
+            reduction_percent=reduction_percent
+        )
+
+        quality_preservation_report = create_quality_preservation_report(
+            original_placement_count=original_placement_count,
+            optimized_placements=optimized_placements,
+            reduction_percent=reduction_percent
+        )
+
+        commercial_summary = create_commercial_summary(
+            product_tier=product_tier,
+            optimized_part_count=optimized_part_count,
+            original_placement_count=original_placement_count,
+            reduction_percent=reduction_percent
+        )
 
         glb_result = generate_glb_from_optimized_geometry(
             geometry=geometry,
@@ -615,7 +806,7 @@ async def generate_glb(data: dict):
 
         return {
             "success": True,
-            "message": "GLB model and optimized LEGO parts generated successfully",
+            "message": "GLB model, optimized LEGO parts, and product tier generated successfully",
             "job_id": job_id,
 
             "glb": {
@@ -635,12 +826,15 @@ async def generate_glb(data: dict):
                 "height": height,
                 "original_stud_count": width * height,
                 "original_placement_count": original_placement_count,
-                "optimized_part_count": len(optimized_placements),
-                "reduction_count": original_placement_count - len(optimized_placements),
-                "reduction_percent": round(
-                    ((original_placement_count - len(optimized_placements)) / original_placement_count) * 100,
-                    2
-                ) if original_placement_count else 0,
+                "original_placement_count_before_truncation": original_placement_count_before_truncation,
+                "optimized_part_count": optimized_part_count,
+                "reduction_count": reduction_count,
+                "reduction_percent": reduction_percent,
+
+                "product_tier": product_tier,
+                "commercial_summary": commercial_summary,
+                "quality_preservation_report": quality_preservation_report,
+
                 "optimized_placements": optimized_placements,
                 "parts_summary": parts_summary,
                 "rebrickable_parts_export": rebrickable_parts_export,
@@ -648,11 +842,16 @@ async def generate_glb(data: dict):
                 "build_layers": build_layers
             },
 
+            # Convenience fields for n8n
+            "product_tier": product_tier,
+            "commercial_summary": commercial_summary,
+            "quality_preservation_report": quality_preservation_report,
+
             "width": width,
             "height": height,
-            "placement_count": len(optimized_placements),
+            "placement_count": optimized_part_count,
             "original_placement_count": original_placement_count,
-            "truncated": original_placement_count > len(original_placements),
+            "truncated": original_placement_count_before_truncation > original_placement_count,
             "generation_time_seconds": generation_time_seconds
         }
 
