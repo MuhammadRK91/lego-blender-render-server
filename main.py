@@ -2,11 +2,13 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import base64
+import json
 import time
 import uuid
 import numpy as np
 import trimesh
 from collections import defaultdict
+from typing import Any
 
 app = FastAPI()
 
@@ -172,134 +174,174 @@ def safe_int(value, default=None):
 # ---------------------------------------------------------------------
 # Input extraction helpers
 # ---------------------------------------------------------------------
+def try_parse_json_string(value):
+    """
+    n8n sometimes sends nested objects as JSON strings.
+    This helper converts those strings back into dict/list objects when possible.
+    """
+    if isinstance(value, str):
+        clean = value.strip()
+        if not clean:
+            return value
+        if (clean.startswith("{") and clean.endswith("}")) or (clean.startswith("[") and clean.endswith("]")):
+            try:
+                return json.loads(clean)
+            except Exception:
+                return value
+    return value
+
+
 def unwrap_n8n_json(data):
     """
-    Handles n8n wrappers:
-    [
-      { "json": { ... } }
-    ]
-    or:
-    { "json": { ... } }
+    Handles common n8n wrappers, but keeps this function conservative.
+    The recursive extractors below handle deeper wrappers.
     """
+    data = try_parse_json_string(data)
+
     if isinstance(data, list) and data:
-        first = data[0]
+        first = try_parse_json_string(data[0])
         if isinstance(first, dict):
-            if "json" in first:
+            if isinstance(first.get("json"), dict):
                 return first["json"]
             return first
 
-    if isinstance(data, dict) and "json" in data and isinstance(data["json"], dict):
-        return data["json"]
+    if isinstance(data, dict):
+        if isinstance(data.get("json"), dict):
+            return data["json"]
 
     return data
 
 
+def debug_received_input(data, geometry=None, candidate_parts_catalog=None):
+    """
+    Adds useful diagnostics to the response so we can see exactly
+    how Render/FastAPI received the n8n HTTP Request body.
+    """
+    root = try_parse_json_string(data)
+
+    debug = {
+        "received_root_type": type(root).__name__,
+        "received_root_keys": list(root.keys()) if isinstance(root, dict) else [],
+        "geometry_detected": geometry is not None,
+        "candidate_parts_catalog_detected": candidate_parts_catalog is not None,
+        "candidate_parts_catalog_type": type(candidate_parts_catalog).__name__ if candidate_parts_catalog is not None else None,
+        "has_direct_image_geometry": isinstance(root, dict) and "image_geometry" in root,
+        "has_direct_candidate_parts_catalog": isinstance(root, dict) and "candidate_parts_catalog" in root,
+        "has_json_wrapper": isinstance(root, dict) and "json" in root,
+        "has_body_wrapper": isinstance(root, dict) and "body" in root,
+        "has_data_wrapper": isinstance(root, dict) and "data" in root,
+    }
+
+    if isinstance(candidate_parts_catalog, dict):
+        optimizer_ready = candidate_parts_catalog.get("optimizer_ready_parts")
+        debug["candidate_parts_catalog_keys"] = list(candidate_parts_catalog.keys())
+        debug["optimizer_ready_parts_count_in_input"] = len(optimizer_ready) if isinstance(optimizer_ready, list) else 0
+    else:
+        debug["candidate_parts_catalog_keys"] = []
+        debug["optimizer_ready_parts_count_in_input"] = 0
+
+    return debug
+
+
 def extract_geometry(data):
     """
-    Accepts these formats:
+    Extracts image_geometry from many possible n8n/body formats.
 
-    1. Direct image_geometry:
-    {
-      "width": 160,
-      "height": 90,
-      "placements": [...]
-    }
-
-    2. Wrapped:
-    {
-      "image_geometry": {
-        "width": 160,
-        "height": 90,
-        "placements": [...]
-      }
-    }
-
-    3. n8n/server array:
-    [
-      {
-        "json": {
-          "image_geometry": {...}
-        }
-      }
-    ]
+    Supported examples:
+    { "image_geometry": {...} }
+    { "json": { "image_geometry": {...} } }
+    [ { "json": { "image_geometry": {...} } } ]
+    { "data": [ { "image_geometry": {...} } ] }
+    { "body": { "image_geometry": {...} } }
+    Direct geometry: { "width": 160, "height": 90, "placements": [...] }
+    Also supports image_geometry accidentally sent as a JSON string.
     """
-    data = unwrap_n8n_json(data)
+    data = try_parse_json_string(data)
+
+    # n8n array wrapper
+    if isinstance(data, list) and data:
+        found = extract_geometry(data[0])
+        if found:
+            return found
+        return None
 
     if not isinstance(data, dict):
         return None
 
-    if "image_geometry" in data and isinstance(data["image_geometry"], dict):
-        return data["image_geometry"]
+    # Direct wrapped image_geometry
+    geometry = try_parse_json_string(data.get("image_geometry"))
+    if isinstance(geometry, dict):
+        if geometry.get("width") and geometry.get("height") and isinstance(geometry.get("placements"), list):
+            return geometry
 
-    if "width" in data and "height" in data and "placements" in data:
+    # Direct geometry
+    if data.get("width") and data.get("height") and isinstance(data.get("placements"), list):
         return data
+
+    # Common wrappers
+    for key in ["json", "body", "payload"]:
+        if key in data:
+            found = extract_geometry(data.get(key))
+            if found:
+                return found
+
+    # data can be dict or list
+    if "data" in data:
+        found = extract_geometry(data.get("data"))
+        if found:
+            return found
 
     return None
 
 
 def extract_candidate_parts_catalog(data):
     """
-    Extracts candidate_parts_catalog from Server 1 output.
+    Extracts candidate_parts_catalog from many possible n8n/body formats.
 
-    Expected:
-    {
-      "candidate_parts_catalog": {
-        "optimizer_ready_parts": [...]
-      }
-    }
+    Supported examples:
+    { "candidate_parts_catalog": {...} }
+    { "json": { "candidate_parts_catalog": {...} } }
+    [ { "json": { "candidate_parts_catalog": {...} } } ]
+    { "data": [ { "candidate_parts_catalog": {...} } ] }
+    { "body": { "candidate_parts_catalog": {...} } }
+    Also supports candidate_parts_catalog accidentally sent as a JSON string.
     """
-    data = unwrap_n8n_json(data)
+    data = try_parse_json_string(data)
+
+    # n8n array wrapper
+    if isinstance(data, list) and data:
+        found = extract_candidate_parts_catalog(data[0])
+        if found:
+            return found
+        return None
 
     if not isinstance(data, dict):
         return None
 
-    if "candidate_parts_catalog" in data and isinstance(data["candidate_parts_catalog"], dict):
-        return data["candidate_parts_catalog"]
+    # Direct case
+    catalog = try_parse_json_string(data.get("candidate_parts_catalog"))
+    if isinstance(catalog, dict):
+        return catalog
+
+    # Some nodes may pass it under different names
+    catalog = try_parse_json_string(data.get("parts_catalog"))
+    if isinstance(catalog, dict):
+        return catalog
+
+    # Common wrappers
+    for key in ["json", "body", "payload"]:
+        if key in data:
+            found = extract_candidate_parts_catalog(data.get(key))
+            if found:
+                return found
+
+    # data can be dict or list
+    if "data" in data:
+        found = extract_candidate_parts_catalog(data.get("data"))
+        if found:
+            return found
 
     return None
-
-
-def get_optimizer_ready_parts(candidate_parts_catalog):
-    if not isinstance(candidate_parts_catalog, dict):
-        return FALLBACK_OPTIMIZER_READY_PARTS
-
-    parts = candidate_parts_catalog.get("optimizer_ready_parts")
-
-    if isinstance(parts, list) and parts:
-        clean_parts = []
-        for p in parts:
-            if not isinstance(p, dict):
-                continue
-
-            if p.get("optimizer_ready") is False:
-                continue
-
-            if p.get("product_safe") is False:
-                continue
-
-            w = safe_int(p.get("w"))
-            h = safe_int(p.get("h"))
-
-            if not w or not h:
-                continue
-
-            if w <= 0 or h <= 0:
-                continue
-
-            # Avoid extremely large parts in automatic optimizer.
-            if w > 8 or h > 8:
-                continue
-
-            clean = dict(p)
-            clean["w"] = w
-            clean["h"] = h
-            clean["role"] = normalize_role(clean.get("role"))
-            clean_parts.append(clean)
-
-        if clean_parts:
-            return clean_parts
-
-    return FALLBACK_OPTIMIZER_READY_PARTS
 
 
 # ---------------------------------------------------------------------
@@ -1103,20 +1145,26 @@ def generate_glb_from_optimized_geometry(geometry, optimized_placements):
 # Main endpoint
 # ---------------------------------------------------------------------
 @app.post("/generate-glb")
-async def generate_glb(data: dict):
+async def generate_glb(data: Any):
     job_id = str(uuid.uuid4())
     start_time = time.time()
 
     try:
         geometry = extract_geometry(data)
         candidate_parts_catalog = extract_candidate_parts_catalog(data)
+        debug_input = debug_received_input(
+            data=data,
+            geometry=geometry,
+            candidate_parts_catalog=candidate_parts_catalog
+        )
 
         if not geometry:
             return JSONResponse(
                 status_code=400,
                 content={
                     "success": False,
-                    "error": "Missing image_geometry. Send { image_geometry: {...}, candidate_parts_catalog: {...} }."
+                    "error": "Missing image_geometry. Send { image_geometry: {...}, candidate_parts_catalog: {...} }.",
+                    "debug_input": debug_input
                 }
             )
 
@@ -1263,6 +1311,7 @@ async def generate_glb(data: dict):
             },
 
             # Convenience fields for n8n
+            "debug_input": debug_input,
             "candidate_catalog_summary": candidate_catalog_summary,
             "product_tier": product_tier,
             "pricing": product_tier,
@@ -1290,6 +1339,7 @@ async def generate_glb(data: dict):
             content={
                 "success": False,
                 "error": str(e),
+                "debug_input": locals().get("debug_input"),
                 "generation_time_seconds": round(time.time() - start_time, 2)
             }
         )
