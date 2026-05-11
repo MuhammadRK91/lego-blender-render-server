@@ -28,23 +28,19 @@ STUD_D = 0.8
 PLATE_H = 0.24
 BLOCK_GAP = 0.025
 
-# ---------------------------------------------------------------------
-# MVP quality mode
-# ---------------------------------------------------------------------
-# For MVP, we do NOT merge pixels into larger parts.
-# Every Server 1 placement becomes one visible 1x1 LEGO-style part.
-# This preserves image detail and avoids quality loss.
-MVP_HIGH_QUALITY_MODE = True
-
-# Higher limit for MVP quality mode.
-# You can reduce this later for production.
-MAX_PLACEMENTS = 100000
+# Safety limit
+MAX_PLACEMENTS = 30000
 
 # ---------------------------------------------------------------------
 # Practical support strategy
 # ---------------------------------------------------------------------
 # The visual GLB keeps the full relief height, but the purchase BOM should
 # not count hidden support plates under every single raised tile.
+# For a real sellable mosaic/relief kit, we count:
+# 1) every visible top tile/part, plus
+# 2) a practical neutral backing/support pack, plus
+# 3) a smaller selective riser pack for raised/high-detail areas.
+# This keeps the visual quality while making the physical BOM commercially practical.
 PRACTICAL_SUPPORT_MODE = True
 BACKING_SUPPORT_RATIO = 0.10
 SELECTIVE_RISER_RATIO = 0.08
@@ -101,8 +97,7 @@ def root():
         "service": "lego-model-generator",
         "message": "Send POST request to /generate-glb with image_geometry and candidate_parts_catalog from Server 1.",
         "uses_blender": False,
-        "mvp_high_quality_mode": MVP_HIGH_QUALITY_MODE,
-        "output": "glb_base64 + high-quality 1x1 LEGO model + practical BOM + pricing"
+        "output": "glb_base64 + optimized_lego_model + practical BOM + pricing"
     }
 
 
@@ -111,10 +106,9 @@ def health():
     return {
         "status": "ok",
         "service": "lego-model-generator",
-        "mode": "mvp_high_quality_1x1_no_merge" if MVP_HIGH_QUALITY_MODE else "image_geometry_to_glb_using_server_1_optimizer_ready_parts",
+        "mode": "image_geometry_to_glb_using_server_1_optimizer_ready_parts",
         "uses_blender": False,
         "supports_candidate_parts_catalog": True,
-        "mvp_high_quality_mode": MVP_HIGH_QUALITY_MODE,
         "pricing_basis": "actual_physical_purchase_part_count_with_practical_support_bom"
     }
 
@@ -256,8 +250,6 @@ def debug_received_input(data, geometry=None, candidate_parts_catalog=None):
         "has_json_wrapper": isinstance(root, dict) and "json" in root,
         "has_body_wrapper": isinstance(root, dict) and "body" in root,
         "has_data_wrapper": isinstance(root, dict) and "data" in root,
-        "mvp_high_quality_mode": MVP_HIGH_QUALITY_MODE,
-        "max_placements": MAX_PLACEMENTS,
     }
 
     if isinstance(candidate_parts_catalog, dict):
@@ -372,10 +364,15 @@ def extract_candidate_parts_catalog(data):
     return None
 
 
+
+
 def get_optimizer_ready_parts(candidate_parts_catalog):
     """
     Returns optimizer-ready parts from Server 1 candidate_parts_catalog.
     Falls back to safe default catalog if catalog is missing or invalid.
+
+    This function is required by build_optimizer_catalog().
+    Without it, Server 2 raises: name 'get_optimizer_ready_parts' is not defined.
     """
     if not isinstance(candidate_parts_catalog, dict):
         return FALLBACK_OPTIMIZER_READY_PARTS
@@ -427,8 +424,10 @@ def build_optimizer_catalog(candidate_parts_catalog):
     """
     Builds a dynamic part catalog from Server 1 optimizer_ready_parts.
 
-    In MVP_HIGH_QUALITY_MODE, this catalog is still used to choose the
-    correct 1x1 visible part and 1x1 support part, but no grid merging happens.
+    Important:
+    - Server 2 no longer uses only hardcoded 7 plates.
+    - Server 2 uses optimizer_ready_parts from Server 1.
+    - Fallback catalog is used only if Server 1 does not send a catalog.
     """
     optimizer_ready_parts = get_optimizer_ready_parts(candidate_parts_catalog)
 
@@ -578,97 +577,21 @@ def mark_used(used, x, y, w, h):
             used[yy][xx] = True
 
 
-def create_high_quality_1x1_geometry(geometry, candidate_parts_catalog=None):
-    """
-    MVP high-quality mode.
-
-    Every input placement from Server 1 becomes one visible 1x1 part.
-    No merging.
-    No part optimization.
-    No reduction.
-    No visual compromise.
-
-    This is heavier, but it preserves the image quality.
-    """
-    catalog = build_optimizer_catalog(candidate_parts_catalog)
-
-    width = int(geometry.get("width", 0))
-    height = int(geometry.get("height", 0))
-    placements = geometry.get("placements", [])
-
-    if width <= 0 or height <= 0:
-        raise ValueError("image_geometry.width and image_geometry.height are required.")
-
-    if not isinstance(placements, list) or not placements:
-        raise ValueError("image_geometry.placements[] is required.")
-
-    optimized = []
-
-    # Prefer 1x1 surface/detail pieces for visible quality.
-    visible_part, orientation = find_part_for_size(
-        catalog=catalog,
-        w=1,
-        h=1,
-        preferred_roles=["surface", "detail", "structure"]
-    )
-
-    support_part, support_orientation = find_part_for_size(
-        catalog=catalog,
-        w=1,
-        h=1,
-        preferred_roles=["structure", "surface"]
-    )
-
-    for cell in placements:
-        x = int(cell.get("x", 0))
-        y = int(cell.get("y", 0))
-
-        if not (0 <= x < width and 0 <= y < height):
-            continue
-
-        height_plates = max(1, min(12, int(cell.get("height_plates", 1))))
-
-        optimized.append({
-            "x": x,
-            "y": y,
-            "z": int(cell.get("z", 0)),
-            "w": 1,
-            "h": 1,
-
-            "part_name": visible_part["part_name"],
-            "part_num": visible_part["part_num"],
-            "official_part_name": visible_part.get("official_part_name"),
-            "part_role": visible_part.get("role"),
-            "part_category": visible_part.get("part_category"),
-
-            "support_part_name": support_part["part_name"],
-            "support_part_num": support_part["part_num"],
-            "support_official_part_name": support_part.get("official_part_name"),
-            "support_part_role": support_part.get("role"),
-
-            "color": cell.get("color"),
-            "rebrickable_color_id": cell.get("rebrickable_color_id"),
-            "rebrickable_color_name": cell.get("rebrickable_color_name"),
-            "rebrickable_color_rgb": normalize_hex(cell.get("rebrickable_color_rgb")),
-            "height_plates": height_plates,
-            "orientation": orientation,
-            "support_orientation": support_orientation,
-            "source_rgb": cell.get("source_rgb", {}),
-
-            "physical_parts_note": "MVP high-quality mode: every original image cell is preserved as one visible 1x1 part."
-        })
-
-    return optimized, catalog
-
-
 def optimize_image_geometry(geometry, candidate_parts_catalog=None):
     """
     Converts raw 1x1 placement grid into larger realistic LEGO placements
     wherever possible.
 
     Important:
-    This optimization is quality-safe, but for MVP it is disabled by
-    MVP_HIGH_QUALITY_MODE=True.
+    This optimization is quality-safe.
+    It only combines adjacent cells when they already share the exact same:
+    - color ID / color
+    - Rebrickable RGB
+    - height_plates
+
+    It does not lower resolution.
+    It does not merge similar colors.
+    It does not remove details.
     """
     catalog = build_optimizer_catalog(candidate_parts_catalog)
 
@@ -762,6 +685,8 @@ def optimize_image_geometry(geometry, candidate_parts_catalog=None):
                 preferred_roles=preferred_roles
             )
 
+            # Structural support part:
+            # Used in purchase list to represent stacked plates below the visible top tile/plate.
             support_part, support_orientation = find_part_for_size(
                 catalog=catalog,
                 w=chosen_w,
@@ -809,7 +734,7 @@ def add_purchase_part(agg, part_num, part_name, color_id, color_name, color_rgb,
     if not part_num or quantity <= 0:
         return
 
-    key = f"{part_num}-{color_id}-{role}"
+    key = f"{part_num}-{color_id}"
 
     if key not in agg:
         agg[key] = {
@@ -865,9 +790,6 @@ def get_best_support_part(optimized_placements):
     """
     Finds a realistic structure plate already selected by the optimizer.
     Prefer larger plates because they reduce hidden support quantity.
-
-    In MVP_HIGH_QUALITY_MODE, placements are 1x1, so this will usually
-    return a 1x1 support part.
     """
     candidates = {}
 
@@ -893,6 +815,7 @@ def get_best_support_part(optimized_placements):
             }
 
     if candidates:
+        # Prefer common large support plates when present.
         preferred_order = ["3020", "3021", "3022", "3710", "3623", "3023", "3024"]
         for part_num in preferred_order:
             if part_num in candidates:
@@ -901,11 +824,11 @@ def get_best_support_part(optimized_placements):
         return sorted(candidates.values(), key=lambda x: x["area"], reverse=True)[0]
 
     return {
-        "part_num": "3024",
-        "part_name": "Plate 1x1",
-        "area": 1,
-        "w": 1,
-        "h": 1,
+        "part_num": "3020",
+        "part_name": "Plate 2x4",
+        "area": 8,
+        "w": 2,
+        "h": 4,
     }
 
 
@@ -913,6 +836,12 @@ def calculate_practical_support_quantities(optimized_placements):
     """
     Calculates a practical hidden support pack instead of stacking plates
     under every raised visible piece.
+
+    Why this is more realistic:
+    - A real product can use a backing board/base layer for stability.
+    - We only need selective LEGO support/riser pieces, not full solid stacks
+      under every visible tile.
+    - The GLB still shows the visual relief; only the purchase BOM becomes practical.
     """
     visible_count = len(optimized_placements)
 
@@ -933,6 +862,8 @@ def calculate_practical_support_quantities(optimized_placements):
     elevated_count = sum(1 for h in heights if h > median_height)
     high_detail_count = sum(1 for h in heights if h >= median_height + 2)
 
+    # Old solid-stack logic roughly counted (height_plates - 1) hidden supports
+    # per visible placement. We keep this only as a comparison/diagnostic.
     estimated_solid_stack_support_qty = sum(max(0, h - 1) for h in heights)
 
     backing_support_qty = int(round(visible_count * BACKING_SUPPORT_RATIO))
@@ -941,6 +872,7 @@ def calculate_practical_support_quantities(optimized_placements):
 
     total = backing_support_qty + selective_riser_qty + edge_reinforcement_qty
 
+    # Keep support pack useful but capped.
     min_support = min(MIN_PRACTICAL_SUPPORT_PARTS, max(0, visible_count))
     max_support = int(round(visible_count * MAX_PRACTICAL_SUPPORT_RATIO_OF_VISIBLE))
 
@@ -950,6 +882,7 @@ def calculate_practical_support_quantities(optimized_placements):
     if max_support > 0 and total > max_support:
         total = max_support
 
+    # Rebalance after caps.
     backing_support_qty = int(round(total * 0.55))
     selective_riser_qty = int(round(total * 0.30))
     edge_reinforcement_qty = max(0, total - backing_support_qty - selective_riser_qty)
@@ -972,12 +905,14 @@ def calculate_practical_support_quantities(optimized_placements):
 
 def create_purchase_parts_summary(optimized_placements):
     """
-    Purchase-focused parts grouped by part_num + color_id.
+    Purchase-focused parts grouped by part_num + color_id only.
 
     Practical BOM logic:
     - Count every visible top tile/part exactly once.
     - Do NOT stack hidden support plates under every raised tile.
     - Add a neutral practical support pack for backing, selective risers, and edge reinforcement.
+
+    This keeps the visual output quality but makes the real kit commercially practical.
     """
     agg = {}
 
@@ -987,6 +922,9 @@ def create_purchase_parts_summary(optimized_placements):
         color_rgb = p.get("rebrickable_color_rgb")
         height_plates = max(1, min(12, int(p.get("height_plates", 1))))
 
+        # One visible top piece only.
+        # Height remains in optimized_placements/build_layers for instructions and GLB,
+        # but we do not multiply quantity by height_plates in the purchase BOM.
         add_purchase_part(
             agg=agg,
             part_num=p.get("part_num"),
@@ -1053,7 +991,6 @@ def create_support_strategy_summary(optimized_placements, purchase_parts_summary
         "support_strategy": "practical_backing_and_selective_risers",
         "visual_quality_preserved": True,
         "glb_relief_height_preserved": True,
-        "mvp_high_quality_mode": MVP_HIGH_QUALITY_MODE,
         "bom_support_mode": "practical_not_solid_stack",
         "visible_top_piece_count": visible_top_piece_count,
         "practical_support_piece_count": support_piece_count,
@@ -1063,8 +1000,8 @@ def create_support_strategy_summary(optimized_placements, purchase_parts_summary
         "backing_support_qty": support_quantities.get("backing_support_qty"),
         "selective_riser_qty": support_quantities.get("selective_riser_qty"),
         "edge_reinforcement_qty": support_quantities.get("edge_reinforcement_qty"),
-        "explanation": "The visible design is unchanged. The BOM counts one visible top piece per visual placement plus a neutral backing/riser support pack, instead of stacking hidden plates under every raised tile.",
-        "production_note": "For physical production, use a rigid backing/base and selective LEGO support pieces. This keeps the product buildable without creating an unrealistic solid-stack kit."
+        "explanation": "The visible design is unchanged. The BOM now counts one visible top piece per optimized block plus a neutral backing/riser support pack, instead of stacking hidden plates under every raised tile.",
+        "production_note": "For physical production, use a rigid backing/base and selective LEGO support pieces. This keeps the product buildable without creating an unrealistic 20k+ part kit."
     }
 
 
@@ -1162,6 +1099,7 @@ def calculate_price_from_part_count(
     position = (physical_part_count - min_parts) / (max_parts - min_parts)
     price = min_price + (position * (max_price - min_price))
 
+    # Round to a clean selling price ending in 9.
     rounded = int(round(price / 10.0) * 10)
 
     if rounded <= 50:
@@ -1173,6 +1111,11 @@ def calculate_price_from_part_count(
 def classify_product_tier(physical_part_count, optimized_visual_block_count, original_stud_count, reduction_percent):
     """
     Classifies price tier based on actual physical purchase part count.
+
+    Important:
+    - This does not reduce quality.
+    - This does not use image complexity to increase price.
+    - Basic / Standard / Premium means part-count tier, not quality tier.
     """
     if physical_part_count <= 1500:
         min_parts = 1
@@ -1255,6 +1198,7 @@ def classify_product_tier(physical_part_count, optimized_visual_block_count, ori
             "market_position": "Large custom LEGO-style display product"
         }
 
+    # Ultra pricing continues above 8,000 parts.
     extra_parts = physical_part_count - 8000
     raw_price = 699 + (extra_parts * 0.09)
     recommended_price = int(round(raw_price / 10.0) * 10) - 1
@@ -1280,23 +1224,15 @@ def classify_product_tier(physical_part_count, optimized_visual_block_count, ori
     }
 
 
-def create_quality_preservation_report(
-    original_placement_count,
-    optimized_visual_block_count,
-    physical_part_count,
-    reduction_percent,
-    catalog_source,
-    support_strategy_summary=None
-):
+def create_quality_preservation_report(original_placement_count, optimized_visual_block_count, physical_part_count, reduction_percent, catalog_source, support_strategy_summary=None):
     """
-    Explains how image quality was handled.
+    Explains how the optimizer reduced visual block count without damaging image quality.
     """
     return {
         "quality_preserved": True,
-        "mvp_high_quality_mode": MVP_HIGH_QUALITY_MODE,
-        "optimization_method": "mvp_high_quality_1x1_no_merge" if MVP_HIGH_QUALITY_MODE else "lossless_grid_merge_with_realistic_part_catalog",
+        "optimization_method": "lossless_grid_merge_with_realistic_part_catalog",
         "catalog_source": catalog_source,
-        "description": "MVP mode keeps every original image placement as a separate 1x1 visible part. No merging is applied." if MVP_HIGH_QUALITY_MODE else "The optimizer only combines adjacent cells when they have the same LEGO color and same height_plates value.",
+        "description": "The optimizer only combines adjacent cells when they have the same LEGO color and same height_plates value.",
         "does_not_change": [
             "image resolution",
             "color mapping",
@@ -1305,29 +1241,23 @@ def create_quality_preservation_report(
             "important visual details"
         ],
         "what_changed": [
-            "MVP high-quality mode keeps the original image geometry as 1x1 visible placements",
-            "no adjacent cells are merged into larger parts",
-            "purchase_parts_list groups real physical parts by part number and color",
-            "hidden support is counted using a practical backing/selective-riser strategy instead of full solid stacking"
-        ] if MVP_HIGH_QUALITY_MODE else [
             "multiple adjacent matching 1x1 grid cells can become larger footprint parts",
-            "Server 2 uses optimizer_ready_parts from Server 1 instead of only hardcoded plates",
+            "Server 2 now uses optimizer_ready_parts from Server 1 instead of only 7 hardcoded plates",
             "purchase_parts_list groups real physical parts by part number and color",
-            "hidden support is counted using a practical backing/selective-riser strategy instead of full solid stacking"
+            "hidden support is now counted using a practical backing/selective-riser strategy instead of full solid stacking"
         ],
         "original_placement_count": original_placement_count,
         "optimized_visual_block_count": optimized_visual_block_count,
         "actual_physical_purchase_part_count": physical_part_count,
         "visual_block_reduction_percent": reduction_percent,
         "support_strategy_summary": support_strategy_summary or {},
-        "warning": "For MVP, quality is prioritized over part-count optimization. Production optimization can be enabled later by setting MVP_HIGH_QUALITY_MODE=False."
+        "warning": "Further reduction should be done by changing product size/version, not by damaging this quality-preserved version."
     }
 
 
 def create_commercial_summary(product_tier, physical_part_count, optimized_visual_block_count, original_placement_count, reduction_percent):
     return {
         "pricing_basis": "actual_physical_purchase_part_count_with_practical_support_bom",
-        "mvp_high_quality_mode": MVP_HIGH_QUALITY_MODE,
         "tier": product_tier.get("tier"),
         "recommended_selling_position": product_tier.get("market_position"),
         "physical_part_count": physical_part_count,
@@ -1338,8 +1268,8 @@ def create_commercial_summary(product_tier, physical_part_count, optimized_visua
         "recommended_price_usd": product_tier.get("recommended_price_usd"),
         "price_explanation": product_tier.get("price_explanation"),
         "quality_note": "Basic, Standard, Premium, and Ultra are based on actual physical part count only. They do not mean different generation quality.",
-        "production_note": "MVP mode keeps every original image placement as a 1x1 visible part. This prioritizes image quality over production part optimization.",
-        "recommended_next_action": "Use this for MVP visual validation. Later, enable optimization for production by setting MVP_HIGH_QUALITY_MODE=False."
+        "production_note": "The model is optimized using lossless grid merging, Server 1 optimizer-ready parts, and practical backing/selective-riser support counting. Quality is not reduced to force a cheaper price.",
+        "recommended_next_action": "Use recommended_price_usd as the default product price. Use manual review only for very high physical part-count models."
     }
 
 
@@ -1427,7 +1357,7 @@ def generate_glb_from_optimized_geometry(geometry, optimized_placements):
     combined = trimesh.util.concatenate(meshes)
 
     scene = trimesh.Scene()
-    scene.add_geometry(combined, node_name="lego_relief_model")
+    scene.add_geometry(combined, node_name="optimized_lego_relief_model")
 
     glb_bytes = scene.export(file_type="glb")
 
@@ -1485,29 +1415,17 @@ async def generate_glb(data: Any = Body(...)):
 
         original_placement_count = len(original_placements)
 
-        if MVP_HIGH_QUALITY_MODE:
-            optimized_placements, optimizer_catalog = create_high_quality_1x1_geometry(
-                geometry=geometry,
-                candidate_parts_catalog=candidate_parts_catalog
-            )
-        else:
-            optimized_placements, optimizer_catalog = optimize_image_geometry(
-                geometry=geometry,
-                candidate_parts_catalog=candidate_parts_catalog
-            )
+        optimized_placements, optimizer_catalog = optimize_image_geometry(
+            geometry=geometry,
+            candidate_parts_catalog=candidate_parts_catalog
+        )
 
         instruction_parts_summary = create_instruction_parts_summary(optimized_placements)
         purchase_parts_summary = create_purchase_parts_summary(optimized_placements)
         support_strategy_summary = create_support_strategy_summary(optimized_placements, purchase_parts_summary)
 
         purchase_parts_list = list(purchase_parts_summary.values())
-        purchase_parts_list.sort(
-            key=lambda x: (
-                str(x.get("part_num")),
-                int(x.get("color_id")) if str(x.get("color_id")).isdigit() else 9999,
-                str(x.get("role"))
-            )
-        )
+        purchase_parts_list.sort(key=lambda x: (str(x.get("part_num")), int(x.get("color_id")) if str(x.get("color_id")).isdigit() else 9999))
 
         rebrickable_parts_export = create_rebrickable_parts_export(purchase_parts_summary)
         basic_parts_xml_export = create_basic_xml_export(purchase_parts_summary)
@@ -1567,7 +1485,7 @@ async def generate_glb(data: Any = Body(...)):
 
         return {
             "success": True,
-            "message": "GLB model generated successfully in MVP high-quality mode. Original image placements are preserved as 1x1 visible parts with no visual optimization merge." if MVP_HIGH_QUALITY_MODE else "GLB model, optimized LEGO parts, purchase BOM, instructions, and brick-count pricing generated successfully.",
+            "message": "GLB model, realistic optimized LEGO parts, purchase BOM, instructions, and brick-count pricing generated successfully",
             "job_id": job_id,
 
             "glb": {
@@ -1582,14 +1500,14 @@ async def generate_glb(data: Any = Body(...)):
             "glb_base64": glb_base64,
 
             "lego_model": {
-                "type": "mvp_high_quality_1x1_mosaic_relief_lego_model" if MVP_HIGH_QUALITY_MODE else "optimized_mosaic_relief_lego_model",
-                "mvp_high_quality_mode": MVP_HIGH_QUALITY_MODE,
+                "type": "optimized_mosaic_relief_lego_model",
                 "width": width,
                 "height": height,
                 "original_stud_count": width * height,
                 "original_placement_count": original_placement_count,
                 "original_placement_count_before_truncation": original_placement_count_before_truncation,
 
+                # New clearer counts
                 "optimized_visual_block_count": optimized_visual_block_count,
                 "actual_physical_purchase_part_count": physical_part_count,
 
@@ -1611,11 +1529,11 @@ async def generate_glb(data: Any = Body(...)):
                 # Instruction-focused summary keeps height.
                 "instruction_parts_summary": instruction_parts_summary,
 
-                # Purchase-focused summary gives real physical BOM.
+                # Purchase-focused summary ignores height and gives true physical BOM.
                 "purchase_parts_summary": purchase_parts_summary,
                 "purchase_parts_list": purchase_parts_list,
 
-                # Backward compatibility: parts_summary points to purchase summary.
+                # Backward compatibility: parts_summary now points to purchase summary because that is what you need for real ordering.
                 "parts_summary": purchase_parts_summary,
 
                 "rebrickable_parts_export": rebrickable_parts_export,
